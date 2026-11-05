@@ -1233,24 +1233,34 @@ fn connected_test_daemon(
     (daemon_id, rx)
 }
 
-/// The `exited_before_subscribe` of every `AllNodesReady` queued on `rx`.
-fn received_all_nodes_ready(rx: &mut tokio::sync::mpsc::Receiver<String>) -> Vec<Vec<NodeId>> {
+/// Every coordinator event queued on `rx`.
+fn received_daemon_events(
+    rx: &mut tokio::sync::mpsc::Receiver<String>,
+) -> Vec<DaemonCoordinatorEvent> {
     #[derive(serde::Deserialize)]
     struct OutboundRaw {
         params: Timestamped<DaemonCoordinatorEvent>,
     }
-    let mut frames = Vec::new();
+    let mut events = Vec::new();
     while let Ok(outbound) = rx.try_recv() {
         let outbound: OutboundRaw = serde_json::from_str(&outbound).unwrap();
-        if let DaemonCoordinatorEvent::AllNodesReady {
-            exited_before_subscribe,
-            ..
-        } = outbound.params.inner
-        {
-            frames.push(exited_before_subscribe);
-        }
+        events.push(outbound.params.inner);
     }
-    frames
+    events
+}
+
+/// The `exited_before_subscribe` of every `AllNodesReady` queued on `rx`.
+fn received_all_nodes_ready(rx: &mut tokio::sync::mpsc::Receiver<String>) -> Vec<Vec<NodeId>> {
+    received_daemon_events(rx)
+        .into_iter()
+        .filter_map(|event| match event {
+            DaemonCoordinatorEvent::AllNodesReady {
+                exited_before_subscribe,
+                ..
+            } => Some(exited_before_subscribe),
+            _ => None,
+        })
+        .collect()
 }
 
 /// A two-daemon dataflow whose ready barrier already released, with a
@@ -1636,22 +1646,6 @@ fn disconnect_releases_ready_barrier_when_last_pending_daemon_drops() {
     assert!(df.pending_daemons.is_empty());
 }
 
-/// Every coordinator event queued on `rx`.
-fn received_daemon_events(
-    rx: &mut tokio::sync::mpsc::Receiver<String>,
-) -> Vec<DaemonCoordinatorEvent> {
-    #[derive(serde::Deserialize)]
-    struct OutboundRaw {
-        params: Timestamped<DaemonCoordinatorEvent>,
-    }
-    let mut events = Vec::new();
-    while let Ok(outbound) = rx.try_recv() {
-        let outbound: OutboundRaw = serde_json::from_str(&outbound).unwrap();
-        events.push(outbound.params.inner);
-    }
-    events
-}
-
 /// A coordinator running one dataflow on daemons `a` (node `sender`) and `b`
 /// (node `receiver`), whose spawn is pending on both and whose ready barrier
 /// waits on both. `wait_for_spawn` is parked on the returned receiver.
@@ -1748,12 +1742,13 @@ async fn assert_spawn_failed_by_disconnect(
 }
 
 /// A survivor's report arriving after the disconnect failed the spawn must
-/// not bring the dataflow back or release its nodes.
+/// not bring the dataflow back or release its nodes. Returns the events the
+/// survivor was sent in response.
 fn assert_not_resurrected(
     coordinator: &Coordinator,
     dataflow_id: DataflowId,
     rx_b: &mut tokio::sync::mpsc::Receiver<String>,
-) {
+) -> Vec<DaemonCoordinatorEvent> {
     assert!(!coordinator.running_dataflows.contains_key(&dataflow_id));
     let record = coordinator
         .store
@@ -1775,6 +1770,7 @@ fn assert_not_resurrected(
             .any(|e| matches!(e, DaemonCoordinatorEvent::AllNodesReady { .. })),
         "a late report must not release the survivor's nodes, got {events:?}"
     );
+    events
 }
 
 // #3736: survivor `b` reports ready before its spawn result, then `a`
@@ -1808,7 +1804,17 @@ async fn disconnect_mid_spawn_after_survivor_ready_fails_the_spawn() {
         .handle_spawn_result(dataflow_id, daemon_b, Ok(()))
         .await
         .unwrap();
-    assert_not_resurrected(&coordinator, dataflow_id, &mut rx_b);
+    let events = assert_not_resurrected(&coordinator, dataflow_id, &mut rx_b);
+    // `b` may have created the dataflow only after the first stop reached it,
+    // so its late Ok is answered with another stop.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            DaemonCoordinatorEvent::StopDataflow { dataflow_id: id, force: true, .. }
+                if *id == dataflow_id
+        )),
+        "a late spawn Ok must stop the survivor again, got {events:?}"
+    );
 }
 
 // The other order of the same race, and the common one: `b`'s spawn Ok
@@ -1848,7 +1854,7 @@ async fn disconnect_mid_spawn_after_survivor_spawned_fails_the_spawn() {
         )
         .await
         .unwrap();
-    assert_not_resurrected(&coordinator, dataflow_id, &mut rx_b);
+    let _ = assert_not_resurrected(&coordinator, dataflow_id, &mut rx_b);
 }
 
 // A spawn the disconnect path failed is not failed a second time by the
